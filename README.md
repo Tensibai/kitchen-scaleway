@@ -105,6 +105,7 @@ cinc kitchen converge     # apply your configuration
 cinc kitchen login        # SSH into the running Instance
 cinc kitchen destroy      # delete the Instance
 ```
+
 ## Configuration
 
 Every setting goes under the `driver` key in `kitchen.yml`, and can be overridden
