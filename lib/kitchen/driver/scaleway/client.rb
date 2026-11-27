@@ -101,8 +101,8 @@ module Kitchen
         # @param path [String] absolute path
         # @return [Object, nil] parsed JSON response body, or `nil` for 204
         # @raise [ApiError] for any non-2xx response or transport failure
-        def delete(path)
-          request(:delete, path)
+        def delete(path, params: nil)
+          request(:delete, path, params: params)
         end
 
         private
@@ -111,7 +111,7 @@ module Kitchen
         #
         # @param method [Symbol] `:get`, `:post`, `:put` or `:delete`
         # @param path [String] absolute path
-        # @param params [Hash, nil] query string parameters (GET only)
+        # @param params [Hash, nil] query string parameters
         # @param json [Hash, nil] JSON request body
         # @return [Object, nil] parsed JSON response body
         # @raise [ApiError] for any non-2xx response or transport failure

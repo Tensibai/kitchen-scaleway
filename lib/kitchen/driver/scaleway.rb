@@ -137,39 +137,32 @@ module Kitchen
 
       # Provisions an Instance and waits until it is reachable over SSH.
       #
-      # The method is idempotent: if `state` already carries a `:server_id` the
-      # Instance is assumed to exist and nothing is provisioned, which keeps a
-      # retried `kitchen create` from orphaning the Instance made by the run
-      # that failed.
+      # A retry reuses the recorded Instance and completes any pending setup.
       #
-      # @param state [Hash] mutable instance state, populated with
-      #   `:server_id`, `:hostname`, `:username` and `:port`
+      # @param state [Hash] mutable instance state
       # @return [void]
-      # @raise [Kitchen::ActionFailed] if the API rejects the request, or the
-      #   Instance does not become running with a public IPv4 address before
-      #   `config[:server_wait_timeout]` elapses
       def create(state)
         if state[:server_id]
           info("Scaleway instance <#{state[:server_id]}> already created.")
-          return
+        else
+          super
+          zone = config[:zone]
+          server = create_server(zone: zone)
+          state[:server_id] = server.fetch("id")
+          state[:scaleway_zone] = zone
+          record_allocations(state, server)
+          info("Scaleway instance <#{state[:server_id]}> created.")
         end
 
-        super
-
-        server = create_server
-        state[:server_id] = server["id"]
-        info("Scaleway instance <#{state[:server_id]}> created.")
-
-        upload_user_data(state[:server_id]) unless config[:user_data].to_s.empty?
-
-        server = wait_for_started(state[:server_id])
-        hostname = public_ipv4(server)
-        unless hostname
-          raise ActionFailed, "The Scaleway instance <#{state[:server_id]}> never " \
-            "reported a public IPv4 address."
+        path = server_path(state[:server_id], zone: state[:scaleway_zone])
+        if !state[:scaleway_user_data_uploaded] && !config[:user_data].to_s.empty?
+          upload_user_data(path)
+          state[:scaleway_user_data_uploaded] = true
         end
 
-        state[:hostname] = hostname
+        server = wait_for_started(path)
+        record_allocations(state, server) if state[:scaleway_zone]
+        state[:hostname] = public_ipv4(server)
         state[:username] = config[:username]
         state[:port] = config[:port]
 
@@ -178,25 +171,84 @@ module Kitchen
         debug("scaleway:create #{state[:hostname]}")
       end
 
-      # Destroys the Instance recorded in `state`, if there is one.
+      # Destroys the Instance and resources allocated by this driver.
       #
-      # @param state [Hash] mutable instance state; `:server_id` and
-      #   `:hostname` are removed once the Instance is gone
+      # @param state [Hash] mutable instance state
       # @return [void]
-      # @raise [Kitchen::ActionFailed] if the API rejects the request
       def destroy(state)
         server_id = state[:server_id]
-        return if server_id.nil?
+        return unless server_id
 
-        if find_server(server_id).nil?
-          info("Scaleway instance <#{server_id}> is already gone.")
-        else
-          api_call { client.delete(server_path(server_id)) }
-          info("Scaleway instance <#{server_id}> destroyed.")
+        zone = state[:scaleway_zone] || config[:zone]
+        path = server_path(server_id, zone: zone)
+        server = nil
+        wait_until("Scaleway instance <#{server_id}> to finish changing state") do
+          server = find_server(server_id, zone: zone)
+          server.nil? || !%w{starting stopping pausing locked}.include?(server["status"])
+        end
+        if server
+          record_allocations(state, server) if state[:scaleway_zone]
+          delete_server(path, server, state)
         end
 
-        state.delete(:server_id)
-        state.delete(:hostname)
+        if (volume_id = state[:scaleway_sbs_volume_id])
+          api_call(allow_missing: true) { client.delete("/block/v1/zones/#{zone}/volumes/#{volume_id}") }
+        end
+
+        info("Scaleway instance <#{server_id}> #{server ? "destroyed" : "is already gone"}.")
+        %i{server_id hostname username port scaleway_zone scaleway_ip_ids scaleway_volume_ids
+           scaleway_sbs_volume_id scaleway_user_data_uploaded}.each { |key| state.delete(key) }
+      end
+
+      # Records the allocated IP and root volume as their IDs become available.
+      #
+      # @param state [Hash] mutable instance state
+      # @param server [Hash] server API response
+      # @return [void]
+      def record_allocations(state, server)
+        ips = Array(server.dig("public_network_interface", "ips"))
+        if Array(state[:scaleway_ip_ids]).empty? && ips.one? && ips.first["id"]
+          state[:scaleway_ip_ids] = [ips.first["id"]]
+        end
+
+        return if state[:scaleway_volume_ids] || state[:scaleway_sbs_volume_id]
+
+        volumes = Array(server["volumes"])
+        volume = if server["boot_volume_id"]
+                   volumes.find { |item| item["id"] == server["boot_volume_id"] }
+                 elsif volumes.one?
+                   volumes.first
+                 end
+        return unless volume && volume["id"]
+
+        if volume["volume_type"] == "sbs"
+          state[:scaleway_sbs_volume_id] = volume["id"]
+        else
+          state[:scaleway_volume_ids] = [volume["id"]]
+        end
+      end
+
+      # Requests deletion and waits for asynchronous teardown when needed.
+      #
+      # @param path [String] server API path
+      # @param server [Hash] current server response
+      # @param state [Hash] mutable instance state
+      # @return [void]
+      def delete_server(path, server, state)
+        options = {}
+        options[:delete_ip_ids] = state[:scaleway_ip_ids] unless Array(state[:scaleway_ip_ids]).empty?
+        options[:delete_volume_ids] = state[:scaleway_volume_ids] unless Array(state[:scaleway_volume_ids]).empty?
+
+        if %w{started paused}.include?(server["status"])
+          result = api_call(allow_missing: true) { client.post("#{path}/stop-and-delete", options) }
+          if result
+            wait_until("Scaleway instance <#{state[:server_id]}> to be deleted") do
+              api_call(allow_missing: true) { client.get(path) }.nil?
+            end
+          end
+        else
+          api_call(allow_missing: true) { client.delete(path, params: options) }
+        end
       end
 
       # Reports what Scaleway currently thinks of the Instance.
@@ -207,7 +259,7 @@ module Kitchen
       def status(state)
         return super unless state[:server_id]
 
-        server = lookup_server(state[:server_id])
+        server = lookup_server(state[:server_id], zone: state[:scaleway_zone])
         return super unless server
 
         {
@@ -239,13 +291,14 @@ module Kitchen
 
       # Submits the Instance create request built from the driver configuration.
       #
+      # @param zone [String, nil] zone to create the server in
       # @return [Hash<String, Object>] the newly created Server object
       # @raise [Kitchen::ActionFailed] if the API rejects the request or returns
       #   a response that cannot be read as a Server
-      def create_server
+      def create_server(zone: nil)
         debug_server_config
 
-        response = api_call { client.post(servers_path, server_create_payload) }
+        response = api_call { client.post(servers_path(zone: zone), server_create_payload) }
         server = unpack_server(response)
         unless server
           raise ActionFailed, "Could not create the Scaleway instance: the API " \
@@ -298,57 +351,46 @@ module Kitchen
         payload
       end
 
-      # Uploads cloud-init user data to an Instance, if any was configured.
+      # Uploads configured cloud-init data.
       #
-      # A failure to upload is logged but does not fail `create`: the instance
-      # is already running and billable, and a transient API failure should not
-      # orphan it.
-      #
-      # @param server_id [String] the Instance ID
+      # @param path [String] server API path
       # @return [void]
-      def upload_user_data(server_id)
+      def upload_user_data(path)
         api_call do
-          client.put("#{server_path(server_id)}/user-data/cloud-init", content: config[:user_data].to_s)
+          client.put("#{path}/user-data/cloud-init", content: config[:user_data].to_s)
         end
         debug("scaleway:user_data uploaded")
-      rescue Kitchen::ActionFailed => e
-        warn("Could not upload user data for instance <#{server_id}>: #{e.message}")
       end
 
-      # Polls the API until the Instance reports it is running.
+      # Polls until the Instance is running and has a public IPv4 address.
       #
-      # @param server_id [String] the Instance ID to poll
-      # @return [Hash<String, Object>] the Server object
-      # @raise [Kitchen::ActionFailed] if the Instance does not reach the
-      #   running status before `config[:server_wait_timeout]` elapses
-      def wait_for_started(server_id)
+      # @param path [String] server API path
+      # @return [Hash] the ready server
+      def wait_for_started(path)
         server = nil
-
-        wait_until("Scaleway instance <#{server_id}> to be running") do
-          server = find_server(server_id)
-          !server.nil? && server["status"] == "started"
+        wait_until("Scaleway instance at #{path} to be running with a public IPv4 address") do
+          server = api_call(allow_missing: true) { client.get(path) }
+          server && server["status"] == "started" && public_ipv4(server)
         end
-
         server
       end
 
-      # Looks an Instance up by ID, treating "not found" as a normal outcome.
+      # Looks an Instance up by ID, treating a 404 as a missing Instance.
       #
       # @param server_id [String] ID of the Instance to fetch
-      # @return [Hash<String, Object>, nil] the Server object, or `nil` if it no
-      #   longer exists
-      # @raise [Kitchen::ActionFailed] for any API error other than a 404
-      def find_server(server_id)
-        api_call(allow_missing: true) { client.get(server_path(server_id)) }
+      # @param zone [String, nil] zone recorded at creation
+      # @return [Hash, nil] the server
+      def find_server(server_id, zone: nil)
+        api_call(allow_missing: true) { client.get(server_path(server_id, zone: zone)) }
       end
 
-      # Looks an Instance up without turning an unreachable API into a failure.
+      # Looks an Instance up for status reporting.
       #
       # @param server_id [String] ID of the Instance to fetch
-      # @return [Hash<String, Object>, nil] the Server object, or `nil` when it
-      #   is gone or Scaleway cannot be reached
-      def lookup_server(server_id)
-        find_server(server_id)
+      # @param zone [String, nil] zone recorded at creation
+      # @return [Hash, nil] the server
+      def lookup_server(server_id, zone: nil)
+        find_server(server_id, zone: zone)
       rescue Kitchen::ActionFailed
         nil
       end
@@ -534,17 +576,19 @@ module Kitchen
 
       # Absolute path of the servers collection for the configured zone.
       #
+      # @param zone [String, nil] zone to use instead of current configuration
       # @return [String] the servers path
-      def servers_path
-        "#{INSTANCE_API_PREFIX}/#{config[:zone]}/servers"
+      def servers_path(zone: nil)
+        "#{INSTANCE_API_PREFIX}/#{zone || config[:zone]}/servers"
       end
 
       # Absolute path of a single Server.
       #
       # @param server_id [String] the Instance ID
+      # @param zone [String, nil] zone to use instead of current configuration
       # @return [String] the server path
-      def server_path(server_id)
-        "#{servers_path}/#{server_id}"
+      def server_path(server_id, zone: nil)
+        "#{servers_path(zone: zone)}/#{server_id}"
       end
 
       # Writes the resolved Instance configuration to the debug log.

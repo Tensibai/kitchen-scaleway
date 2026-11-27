@@ -292,7 +292,9 @@ so debug logs are safe to paste into a bug report.
 ### Cleaning up
 
 If a run is interrupted, the Instance may outlive it. `cinc kitchen destroy` is
-the first thing to try. If Test Kitchen has lost track of the instance, delete
+the first thing to try. For instances created with an older driver version,
+use the original zone and check the console for any remaining public IPs
+or block volumes. If Test Kitchen has lost track of the instance, delete
 it by name or tag from the console, or with the `scw` CLI:
 
 ```bash
