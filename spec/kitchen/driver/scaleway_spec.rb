@@ -53,13 +53,13 @@ RSpec.describe Kitchen::Driver::Scaleway do
     end
 
     it "reports an unknown status when the server is gone" do
-      allow(driver).to receive(:find_server).with("server-1234").and_return(nil)
+      allow(driver).to receive(:find_server).with("server-1234", zone: nil).and_return(nil)
 
       expect(driver.status(server_id: "server-1234")).to include(state: "unknown")
     end
 
     it "reports a running server as live" do
-      allow(driver).to receive(:find_server).with("server-1234").and_return(server)
+      allow(driver).to receive(:find_server).with("server-1234", zone: nil).and_return(server)
 
       expect(driver.status(server_id: "server-1234")).to include(
         live: true, state: "started", source: "driver", resource_id: "server-1234"
@@ -366,10 +366,24 @@ RSpec.describe Kitchen::Driver::Scaleway do
       expect(state[:server_id]).to eq("server-1234")
     end
 
+    it "records the zone, public IP and SBS root volume allocated by the create response" do
+      stub_server_create(server: server_payload(
+        "volumes" => [{ "id" => "sbs-root", "volume_type" => "sbs" }]
+      ))
+
+      driver.create(state)
+
+      expect(state).to include(
+        scaleway_zone: "fr-par-1",
+        scaleway_ip_ids: ["ip-1234"],
+        scaleway_sbs_volume_id: "sbs-root"
+      )
+    end
+
     it "records the public IPv4 address as the hostname" do
       driver.create(state)
 
-      expect(state[:hostname]).to eq("1.2.3.4")
+      expect(state).to include(hostname: "1.2.3.4", scaleway_ip_ids: ["ip-1234"])
     end
 
     it "strips the /32 prefix Scaleway appends to the address" do
@@ -409,12 +423,13 @@ RSpec.describe Kitchen::Driver::Scaleway do
       it "polls until the instance reports started with a public IPv4 address" do
         stub_server_find(servers: [
           server_payload(status: "starting"),
+          server_payload(status: "started", ip: nil),
           server_payload(status: "started", ip: "1.2.3.4"),
         ])
 
         driver.create(state)
 
-        expect(a_request(:get, server_url)).to have_been_made.times(2)
+        expect(a_request(:get, server_url)).to have_been_made.times(3)
       end
 
       it "does not re-fetch the instance once it is started" do
@@ -433,7 +448,7 @@ RSpec.describe Kitchen::Driver::Scaleway do
 
       it "raises a Test Kitchen error when the instance has no public address" do
         stub_server_find(servers: [server_payload(ip: nil)])
-        driver = build_driver({})
+        driver = build_driver(server_wait_timeout: 0)
 
         expect { driver.create(state) }
           .to raise_error(Kitchen::ActionFailed, /public IPv4/)
@@ -456,6 +471,15 @@ RSpec.describe Kitchen::Driver::Scaleway do
 
         expect(a_request(:post, "#{ScalewayAPI::API_ROOT}/instance/v2alpha1/zones/fr-par-1/servers"))
           .not_to have_been_made
+      end
+
+      it "completes readiness after an earlier attempt saved the server ID" do
+        state.delete(:hostname)
+        expect(transport_connection).to receive(:wait_until_ready)
+
+        driver.create(state)
+
+        expect(state[:hostname]).to eq("1.2.3.4")
       end
 
       it "says so in the log" do
@@ -637,12 +661,20 @@ RSpec.describe Kitchen::Driver::Scaleway do
       expect(WebMock).not_to have_requested(:put, %r{/user-data/cloud-init})
     end
 
-    it "warns and carries on when the upload fails" do
+    it "fails the action and retries the upload on the same server" do
       stub_user_data_upload(status: 500)
+      driver = build_driver(user_data: "#cloud-config\n")
 
-      build_driver(user_data: "#cloud-config\n").create(state)
+      expect { driver.create(state) }.to raise_error(Kitchen::ActionFailed, /500/)
+      expect(state).to include(server_id: "server-1234")
+      expect(state).not_to have_key(:hostname)
 
-      expect(log_output).to match(/Could not upload user data/)
+      stub_user_data_upload
+      driver.create(state)
+      driver.create(state)
+
+      expect(WebMock).to have_requested(:put, "#{server_url}/user-data/cloud-init").twice
+      expect(WebMock).to have_requested(:post, server_url.sub("/server-1234", "")).once
     end
   end
 
@@ -650,7 +682,7 @@ RSpec.describe Kitchen::Driver::Scaleway do
     let(:state) { { server_id: "server-1234", hostname: "1.2.3.4" } }
 
     it "deletes the instance and clears the state" do
-      stub_server_find(servers: [server_payload])
+      stub_server_find(servers: [server_payload(status: "stopped")])
       stub_server_delete
 
       driver.destroy(state)
@@ -660,12 +692,61 @@ RSpec.describe Kitchen::Driver::Scaleway do
     end
 
     it "logs that the instance was destroyed" do
-      stub_server_find(servers: [server_payload])
+      stub_server_find(servers: [server_payload(status: "stopped")])
       stub_server_delete
 
       driver.destroy(state)
 
       expect(log_output).to include("Scaleway instance <server-1234> destroyed.")
+    end
+
+    it "uses the recorded zone for a running server and waits for deletion" do
+      state[:scaleway_zone] = "fr-par-1"
+      state[:scaleway_ip_ids] = ["ip-1234"]
+      state[:scaleway_volume_ids] = ["volume-1"]
+      stub_request(:get, server_url)
+        .to_return(
+          { status: 200, body: server_payload(status: "starting").to_json },
+          { status: 200, body: server_payload.to_json },
+          { status: 404 }
+        )
+      stop_and_delete = stub_request(:post, "#{server_url}/stop-and-delete")
+        .with(body: { delete_ip_ids: ["ip-1234"], delete_volume_ids: ["volume-1"] }.to_json)
+        .to_return(status: 200, body: server_payload(status: "stopping").to_json)
+
+      build_driver(zone: "nl-ams-1").destroy(state)
+
+      expect(stop_and_delete).to have_been_requested
+      expect(WebMock).to have_requested(:get, server_url).times(3)
+      expect(state).to be_empty
+    end
+
+    it "passes owned allocation IDs when deleting a stopped server" do
+      state[:scaleway_ip_ids] = ["ip-1234"]
+      state[:scaleway_volume_ids] = ["volume-1"]
+      stub_server_find(servers: [server_payload(status: "stopped")])
+      deletion = stub_request(:delete, server_url)
+        .with(query: { "delete_ip_ids" => "ip-1234", "delete_volume_ids" => "volume-1" })
+        .to_return(status: 204)
+
+      driver.destroy(state)
+
+      expect(deletion).to have_been_requested
+      expect(state).to be_empty
+    end
+
+    it "retains the SBS volume ID until deletion succeeds" do
+      state[:scaleway_sbs_volume_id] = "sbs-root"
+      path = "#{ScalewayAPI::API_ROOT}/block/v1/zones/fr-par-1/volumes/sbs-root"
+      stub_server_missing
+      stub_request(:delete, path).to_return({ status: 409 }, { status: 204 })
+
+      expect { driver.destroy(state) }.to raise_error(Kitchen::ActionFailed, /409/)
+      expect(state).to include(scaleway_sbs_volume_id: "sbs-root")
+
+      driver.destroy(state)
+
+      expect(state).to be_empty
     end
 
     it "does nothing when there is no server in state" do
@@ -705,7 +786,7 @@ RSpec.describe Kitchen::Driver::Scaleway do
     end
 
     it "raises a Test Kitchen error when the delete fails" do
-      stub_server_find(servers: [server_payload(status: "started")])
+      stub_server_find(servers: [server_payload(status: "stopped")])
       stub_request(:delete, server_url)
         .to_return(status: 403, body: error_payload("forbidden", "nope"),
                    headers: ScalewayAPI::JSON_HEADERS)
