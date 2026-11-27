@@ -135,6 +135,12 @@ module Kitchen
       required_config :scw_secret_key
       required_config :project_id
 
+      # Keeps API credentials out of computed instance diagnostics.
+      # @return [Hash] the diagnostic configuration
+      def diagnose
+        super.merge(scw_secret_key: "[REDACTED]")
+      end
+
       # Provisions an Instance and waits until it is reachable over SSH.
       #
       # The method is idempotent: if `state` already carries a `:server_id` the

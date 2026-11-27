@@ -45,6 +45,17 @@ RSpec.describe Kitchen::Driver::Scaleway do
     end
   end
 
+  describe "#diagnose" do
+    it "redacts the token from the resolved instance configuration" do
+      ENV["SCW_SECRET_KEY"] = "private-token"
+      ENV["SCW_DEFAULT_PROJECT_ID"] = "project-1234"
+      driver = build_driver_without_defaults
+
+      expect(driver.diagnose).to include(scw_secret_key: "[REDACTED]", zone: "fr-par-1")
+      expect(driver[:scw_secret_key]).to eq("private-token")
+    end
+  end
+
   describe "#status" do
     let(:server) { server_payload }
 
