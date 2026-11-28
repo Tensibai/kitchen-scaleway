@@ -21,13 +21,19 @@ jobs:
       SCW_DEFAULT_PROJECT_ID: offline-smoke-placeholder
     steps:
       - uses: actions/checkout@v7
+      - name: Check out the canonical Apache fixture
+        uses: actions/checkout@v7
+        with:
+          repository: test-kitchen/test-kitchen
+          ref: 4bbf9023c2dd6a8a54663fe19c7a7ba419abad35
+          path: .apache-fixture-source
+          persist-credentials: false
+          sparse-checkout: test/fixtures/apache2
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.4"
           bundler-cache: true
-      - name: Load all three smoke suites
-        run: |
-          export BUNDLE_GEMFILE="$PWD/Gemfile.smoke"
-          actual=$(bundle exec ruby examples/apache2/run.rb list --bare | sort)
-          expected=$(printf '%s\n' ansible-ubuntu-24 cinc-ubuntu-24 puppet-ubuntu-24)
-          test "$actual" = "$expected"
+      - name: Check the shared fixture files
+        run: ruby .apache-fixture-source/test/fixtures/apache2/sync.rb --check .
+      - name: Check the Apache smoke suites
+        run: bundle exec ruby examples/apache2/check.rb scaleway ubuntu-24 ''
