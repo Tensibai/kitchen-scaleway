@@ -1,5 +1,6 @@
 ---
 extends: default
+ignore: examples/apache2/kitchen.yml
 rules:
   line-length:
     max: 256

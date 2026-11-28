@@ -105,6 +105,7 @@ cinc kitchen converge     # apply your configuration
 cinc kitchen login        # SSH into the running Instance
 cinc kitchen destroy      # delete the Instance
 ```
+
 ## Configuration
 
 Every setting goes under the `driver` key in `kitchen.yml`, and can be overridden
@@ -317,6 +318,27 @@ verifier:
 ```
 
 No driver configuration changes are needed.
+
+## Apache smoke tests
+
+The smoke suites create an Ubuntu 24.04 Instance, provision Apache, verify that
+the service is enabled and serves HTTP 200, then destroy the Instance. Cinc and
+Ansible also check that a second apply makes no changes.
+
+Set the Scaleway credentials and project from the quick start. Install Cinc
+Workstation with `cinc-cli` on `PATH` to run the Cinc suite. From the driver
+checkout, run:
+
+```sh
+export BUNDLE_GEMFILE="$PWD/Gemfile.smoke"
+bundle install
+bundle exec ruby examples/apache2/run.rb test cinc --destroy always
+bundle exec ruby examples/apache2/run.rb test puppet --destroy always
+bundle exec ruby examples/apache2/run.rb test ansible --destroy always
+```
+
+These live runs create billable resources. CI checks that all three suites load
+with the real plugins using placeholder credentials.
 
 ## Contributing
 

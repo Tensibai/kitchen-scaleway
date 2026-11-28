@@ -1,0 +1,9 @@
+---
+driver:
+  name: scaleway
+
+platforms:
+  - name: ubuntu-24
+
+# Shared fixture source: https://github.com/test-kitchen/test-kitchen/tree/main/test/fixtures/apache2
+<%= ERB.new(File.read(File.join(__dir__, "smoke.yml.erb"))).result_with_hash(bootstrap_prefix: "") %>
